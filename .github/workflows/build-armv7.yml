@@ -1,7 +1,7 @@
-name: Build olcrtc for ARMv7 (Android)
+name: Build olcrtc for ARMv7 + Release
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:        # Запуск вручную
   push:
     branches: [ main, master ]
 
@@ -25,10 +25,8 @@ jobs:
 
       - name: Build for Linux ARMv7
         env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # убирает предупреждение
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: |
-          cd $GITHUB_WORKSPACE
-          
           export GOOS=linux
           export GOARCH=arm
           export GOARM=7
@@ -37,20 +35,32 @@ jobs:
           echo "=== Starting build ==="
           mage buildCLI
           
-          ls -la build/ || echo "Build folder not found"
-
-      - name: Prepare binary name
-        run: |
+          # Переименовываем для удобства
           if [ -f build/olcrtc-linux-arm ]; then
             mv build/olcrtc-linux-arm build/olcrtc-armv7
           elif [ -f build/olcrtc ]; then
             mv build/olcrtc build/olcrtc-armv7
           fi
+          
+          ls -la build/
 
-      - name: Upload ARMv7 binary
-        uses: actions/upload-artifact@v4
+      # Шаг для генерации даты сборки
+      - name: Set current date
+        id: date
+        run: echo "build_date=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
+      - name: Create Release and Upload Binary
+        uses: softprops/action-gh-release@v2
         with:
-          name: olcrtc-armv7
-          path: build/olcrtc-armv7
-          if-no-files-found: error
-          retention-days: 30
+          tag_name: armv7-latest
+          name: olcrtc ARMv7 Latest Build
+          draft: false
+          prerelease: true
+          files: build/olcrtc-armv7
+          body: |
+            Автоматическая сборка для ARMv7 (armv7l)
+            Подходит для Realme C11 и других 32-битных устройств.
+            
+            Дата сборки: ${{ steps.date.outputs.build_date }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
