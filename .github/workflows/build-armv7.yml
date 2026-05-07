@@ -1,0 +1,47 @@
+name: Build olcrtc for ARMv7 (Android)
+
+on:
+  workflow_dispatch:     # Запуск вручную
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'     # или 1.24 / 1.25 — можно менять
+
+      - name: Install Mage
+        run: go install github.com/magefile/mage@latest
+
+      - name: Build for Linux ARMv7
+        run: |
+          cd $GITHUB_WORKSPACE
+          export GOOS=linux
+          export GOARCH=arm
+          export GOARM=7
+          export CGO_ENABLED=1
+          
+          mage buildCLI
+
+      - name: Rename binary
+        run: |
+          mv build/olcrtc-linux-arm build/olcrtc-armv7 || true
+          mv build/olcrtc build/olcrtc-armv7 || true
+
+      - name: Upload ARMv7 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: olcrtc-armv7
+          path: build/olcrtc-armv7
+          if-no-files-found: error
+          retention-days: 30
