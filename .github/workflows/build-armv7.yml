@@ -1,14 +1,11 @@
-name: Build olcrtc for ARMv7 + Release
+name: Build olcrtc for ARMv7
 
 on:
-  workflow_dispatch:        # Запуск вручную
-  push:
-    branches: [ main, master ]
+  workflow_dispatch:        # Позволяет запускать сборку вручную кнопкой
 
 jobs:
   build-armv7:
     runs-on: ubuntu-latest
-    # Добавляем права на запись контента (нужно для создания релизов)
     permissions:
       contents: write
 
@@ -23,13 +20,17 @@ jobs:
         with:
           go-version: '1.23.x'
 
+      - name: Install ARM Cross-Compiler
+        # Этого не было у прошлой ИИ! Без этого CGO сборка под ARM упадет.
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf
+
       - name: Install Mage
         run: go install github.com/magefile/mage@latest
 
       - name: Build for Linux ARMv7
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: |
+          # Указываем Go использовать правильный компилятор
+          export CC=arm-linux-gnueabihf-gcc
           export GOOS=linux
           export GOARCH=arm
           export GOARM=7
@@ -38,31 +39,14 @@ jobs:
           echo "=== Starting build ==="
           mage buildCLI
           
-          # Переименовываем для удобства
-          if [ -f build/olcrtc-linux-arm ]; then
-            mv build/olcrtc-linux-arm build/olcrtc-armv7
-          elif [ -f build/olcrtc ]; then
-            mv build/olcrtc build/olcrtc-armv7
-          fi
-          
-          ls -la build/
+          # Переименовываем и перемещаем в корень для удобства
+          find build -type f -name "olcrtc*" -exec cp {} ./olcrtc-armv7 \;
 
-      - name: Set current date
-        id: date
-        run: echo "build_date=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
-
-      - name: Create Release and Upload Binary
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: armv7-latest
-          name: olcrtc ARMv7 Latest Build
+          tag_name: armv7-build-${{ github.run_number }}
+          name: olcrtc ARMv7 Build ${{ github.run_number }}
           draft: false
-          prerelease: true
-          files: build/olcrtc-armv7
-          body: |
-            Автоматическая сборка для ARMv7 (armv7l)
-            Подходит для Realme C11 и других 32-битных устройств.
-            
-            Дата сборки: ${{ steps.date.outputs.build_date }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: false
+          files: ./olcrtc-armv7
