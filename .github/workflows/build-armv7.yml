@@ -1,7 +1,7 @@
 name: Build olcrtc for ARMv7 (Android)
 
 on:
-  workflow_dispatch:     # Запуск вручную
+  workflow_dispatch:
   push:
     branches: [ main, master ]
 
@@ -18,25 +18,34 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23.x'     # или 1.24 / 1.25 — можно менять
+          go-version: '1.23.x'
 
       - name: Install Mage
         run: go install github.com/magefile/mage@latest
 
       - name: Build for Linux ARMv7
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # убирает предупреждение
         run: |
           cd $GITHUB_WORKSPACE
+          
           export GOOS=linux
           export GOARCH=arm
           export GOARM=7
           export CGO_ENABLED=1
           
+          echo "=== Starting build ==="
           mage buildCLI
+          
+          ls -la build/ || echo "Build folder not found"
 
-      - name: Rename binary
+      - name: Prepare binary name
         run: |
-          mv build/olcrtc-linux-arm build/olcrtc-armv7 || true
-          mv build/olcrtc build/olcrtc-armv7 || true
+          if [ -f build/olcrtc-linux-arm ]; then
+            mv build/olcrtc-linux-arm build/olcrtc-armv7
+          elif [ -f build/olcrtc ]; then
+            mv build/olcrtc build/olcrtc-armv7
+          fi
 
       - name: Upload ARMv7 binary
         uses: actions/upload-artifact@v4
