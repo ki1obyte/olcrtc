@@ -8,6 +8,9 @@ on:
 jobs:
   build-armv7:
     runs-on: ubuntu-latest
+    # Добавляем права на запись контента (нужно для создания релизов)
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout code
@@ -44,7 +47,6 @@ jobs:
           
           ls -la build/
 
-      # Шаг для генерации даты сборки
       - name: Set current date
         id: date
         run: echo "build_date=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
