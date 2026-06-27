@@ -7,308 +7,145 @@
 
 </div>
 
+# Быстрый старт
 
-# Быстрый старт (через скрипты)
+> **Важно:** Обязательно проверяйте, есть ли сервис видеозвонков у вас в белых списках. Если его там нет - используйте другой.
 
-Этот способ самый простой. Все запускается в контейнере [Podman](https://ru.wikipedia.org/wiki/Podman).
-Скрипт всё сделает сам: скачает [исходники](https://github.com/openlibrecommunity/olcrtc), соберёт в контейнере, запустит.
+Этот способ запускает `olcrtc` как обычный нативный бинарник. Нужны Go 1.26+, mage, git и curl.
 
-Проект в бете. По проблемам: t.me/openlibrecommunity
-
----
-
-## Что нужно установить
-
-### git
+## Установить зависимости
 
 ```sh
-apt install git    # Debian / Ubuntu / Mint
-pacman -S git      # Arch / CacheOS / Manjaro
-dnf install git    # Fedora / RHEL / CentOS
+apt install git curl        # Debian / Ubuntu / Mint
+pacman -S git curl          # Arch / CachyOS / Manjaro
+dnf install git curl        # Fedora / RHEL / CentOS
 ```
 
-### podman
+Установи Go 1.26+ и mage:
 
 ```sh
-apt install podman   # Debian / Ubuntu / Mint
-pacman -S podman     # Arch / CacheOS / Manjaro
-dnf install podman   # Fedora / RHEL / CentOS
+go install github.com/magefile/mage@latest
+echo 'export PATH="$HOME/go/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
 ```
 
-### curl
+Если на машине меньше 4 ГБ RAM, включи swap перед сборкой:
 
 ```sh
-apt install curl      # Debian / Ubuntu/ Mint
-pacman -S curl        # Arch / CacheOS / Manjaro
-dnf install curl      # Fedora
+sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
 ```
 
----
-
-## Шаг 1: Скачать репозиторий
+## Собрать
 
 ```sh
 git clone https://github.com/openlibrecommunity/olcrtc --recurse-submodules
 cd olcrtc
+mage build
 ```
 
----
-
-## Шаг 2: Запустить сервер
-
-На машине, через которую должен идти трафик (VPS, сервер за рубежом, домашний ПК):
+Бинарник появится в `build/`, например:
 
 ```sh
-./script/srv.sh
+./build/olcrtc-linux-amd64
 ```
 
-Скрипт задаст несколько вопросов.
+## Сгенерировать ключ
 
-### Carrier (на каком сервисе передавать трафик)
-
-```
-Select carrier:
-  1) telemost
-  2) jazz
-  3) wbstream
-Enter choice [1-3, default: 1]:
-```
-
-Выбери сервис. Полную матрицу совместимости смотри в [settings.md](settings.md).
-
-**Рекомендуется `wbstream`** - работает со всеми транспортами.
-
-### Transport (как именно передавать данные)
-
-```
-Select transport:
-  1) datachannel
-  2) videochannel
-  3) seichannel
-  4) vp8channel
-Enter choice [1-4, default: 1]:
-```
-
-Рекомендации:
-- **datachannel** - самый быстрый, минимальный пинг. Работает с `jazz` и `wbstream`. **Jazz банит IP за datachannel** - лучше используй только с `wbstream`.
-- **vp8channel** - работает везде, быстрый, но большой пинг.
-- **seichannel** - работает везде кроме telemost, медленный, но мелкий пинг.
-- **videochannel** - работает везде, самый медленный и большой пинг.
-
-**Лучшая комбинация: `wbstream + datachannel`** - максимальная скорость, минимальный пинг, без риска бана.
-
-### Room ID
-
-```
-Enter Room ID:
-```
-
-Для **telemost** - создай руму через сайт [телемоста](https://telemost.yandex.ru/) и вставь его.
-
-Для **jazz** и **wbstream** скрипт предложит выбор: сгенерировать автоматически (рекомендуется) или ввести существующий ID. При автогенерации скрипт запустит `gen` и получит ID до старта сервера. Также можно создать руму через сайт [jazz](https://salutejazz.ru/calls/create) или [wbstream](https://stream.wb.ru).
-
-### Client ID
-
-```
-Enter Client ID [default: default]:
-```
-
-Это обязательный идентификатор клиента. Он должен быть одинаковым на сервере и клиенте - используется чтобы клиент подключался именно к вашему серверу, а не к случайному серверу в руме.
-
-### DNS
-
-```
-DNS server [default: 1.1.1.1:53]:
-```
-
-Нажми Enter. Менять не нужно если нет причин, на всякий можно поставить 77.88.8.8 или DNS твоего провайдера.
-
-### SOCKS5 прокси для исходящего трафика
-
-```
-Use SOCKS5 proxy for egress? (y/N):
-```
-
-Если нет - просто Enter, если надо то введи `y`. Нужно чтобы сервер сам ходил через прокси.
-
-### Параметры транспорта (только для videochannel)
-
-```
-Video codec:
-  1) qrcode
-  2) tile (requires 1080x1080)
-Enter choice [1-2, default: 1]:
-```
-
-Выбери кодек:
-- **qrcode** - QR-коды, настраиваемое разрешение, стабильный, медленный.
-- **tile** - тайловый кодек, только 1080x1080, поддерживает Reed-Solomon коррекцию, не стабилен, более быстрый.
-
-#### qrcode
-
-```
-Video width [default: 1920]:
-Video height [default: 1080]:
-QR error correction (low/medium/high/highest) [default: low]:
-QR fragment size bytes [default: 0 (auto)]:
-```
-
-- **Video width / height** - разрешение видео. Больше = больше данных за кадр, но тяжелее поток.
-- **QR error correction** - коррекция ошибок: `low` быстрее, `highest` надёжнее при плохом канале.
-- **QR fragment size** - размер фрагмента в байтах. `0` = автоматически.
-
-#### tile
-
-```
-[*] Tile codec selected - forcing 1080x1080
-Tile module size in pixels 1..270 [default: 4]:
-Tile Reed-Solomon parity percent 0..200 [default: 20]:
-```
-
-- **Tile module size** - размер одного тайла в пикселях. Меньше = больше данных за кадр.
-- **Tile Reed-Solomon parity** - процент избыточности. `0` = без коррекции, `20` оптимально.
-
-#### Общие параметры (для обоих кодеков)
-
-```
-Video FPS [default: 30]:
-Video bitrate [default: 2M]:
-Hardware acceleration (none/nvenc) [default: none]:
-```
-
-- **Video FPS** - кадров в секунду. Больше FPS = выше пропускная способность, больше нагрузка на CPU.
-- **Video bitrate** - битрейт ffmpeg. Примеры: `2M`, `5M`, `500K`.
-- **Hardware acceleration** - `none` если нет GPU, `nvenc` для NVIDIA GPU.
-
----
-
-### Параметры транспорта (только для vp8channel)
-
-```
-VP8 FPS [default: 25]: 60
-VP8 batch size (frames per tick) [default: 1]: 64
-```
-
-Введи `60` и `64` - это оптимальные значения.
-
-### Параметры транспорта (только для seichannel)
-
-```
-SEI FPS [default: 20]: 60
-SEI batch size (frames per tick) [default: 1]: 64
-SEI fragment size in bytes [default: 900]: 900
-SEI ACK timeout in milliseconds [default: 3000]: 2000
-```
-
-Нажми Enter для всех - значения по умолчанию оптимальны.
-
-### Результат
-
-После запуска скрипт выведет:
-
-```
-[+] Server started successfully!
-
-Container name: olcrtc-server
-Carrier:        Carrier
-Transport:      Transport
-Room ID:        Room ID
-Client ID:      default
-Encryption key: Encryption key
-```
-
-**Сохрани Room ID, Client ID и Encryption key** - они нужны для клиента.
-
----
-
-## Шаг 3: Запустить клиент
-
-На своей машине (домашний ПК, ноутбук):
+Ключ должен совпадать на сервере и клиенте.
 
 ```sh
-git clone https://github.com/openlibrecommunity/olcrtc --recurse-submodules
-cd olcrtc
-./script/cnc.sh
+openssl rand -hex 32
 ```
 
-Отвечай на те же вопросы что на сервере - **carrier, transport, room ID и client ID должны совпадать**.
+## Запустить сервер
 
-Когда спросит client ID:
+Создай `server.yaml`:
 
-```
-Enter Client ID [default: default]: default
-```
-
-Введи тот же `client ID`, который использовал на сервере.
-
-Когда спросит ключ:
-
-```
-Enter Encryption Key (hex): Encryption key
-```
-
-Вставь ключ с сервера.
-
-### SOCKS5 адрес и порт
-
-```
-SOCKS5 ip [default: 127.0.0.1]:
-SOCKS5 port [default: 8808]:
+```yaml
+mode: srv
+auth:
+  provider: jitsi
+room:
+  id: "https://meet.small-dm.ru/myroom"
+crypto:
+  key: "REPLACE_ME_WITH_64_HEX_CHARS"
+net:
+  transport: datachannel
+  dns: "8.8.8.8:53"
+data: data
 ```
 
-Нажми Enter оба раза. Прокси поднимется на `127.0.0.1:8808`.
+Запусти:
 
-### Результат
-
-```
-[+] Client started successfully!
-
-Container name: olcrtc-client
-Client ID:      default
-SOCKS5 proxy:   127.0.0.1:8808
+```sh
+./build/olcrtc-linux-amd64 server.yaml
 ```
 
----
+## Запустить клиент
 
-## Шаг 4: Проверить
+Создай `client.yaml` на клиентской машине. `auth.provider`, `room.id`, `crypto.key` и `net.transport` должны совпадать с сервером.
+
+```yaml
+mode: cnc
+auth:
+  provider: jitsi
+room:
+  id: "https://meet.small-dm.ru/myroom"
+crypto:
+  key: "REPLACE_ME_WITH_64_HEX_CHARS"
+net:
+  transport: datachannel
+  dns: "8.8.8.8:53"
+socks:
+  host: "127.0.0.1"
+  port: 8808
+data: data
+```
+
+Запусти:
+
+```sh
+./build/olcrtc-linux-amd64 client.yaml
+```
+
+После запуска SOCKS5 будет слушать на `127.0.0.1:8808`.
+
+## Проверить
 
 ```sh
 curl --socks5-hostname 127.0.0.1:8808 https://icanhazip.com
 ```
 
-Должен вернуть IP твоего сервера.
-
-Или выставить переменную окружения чтобы всё шло через прокси:
-
-```sh
-export all_proxy=socks5h://127.0.0.1:8808
-curl https://icanhazip.com
-```
-
----
+Должен вернуться IP сервера.
 
 ## Управление
 
-### Логи
+Остановка ручного запуска - `Ctrl+C`.
+
+Если процесс запущен в фоне:
 
 ```sh
-podman logs -f olcrtc-server   # на сервере
-podman logs -f olcrtc-client   # на клиенте
+pgrep -af olcrtc
+kill <pid>
 ```
 
-### Остановить
+Обновление:
 
 ```sh
-podman stop olcrtc-server
-podman stop olcrtc-client
+git pull --recurse-submodules
+mage build
 ```
 
-### Перезапустить (просто запусти скрипт снова)
+Перезапусти сервер и клиент с теми же YAML-конфигами.
 
-Скрипт сам останавливает старый контейнер перед стартом нового.
+## Несколько инстансов
 
----
+Можно запустить несколько серверов или клиентов на одной машине: создай отдельный YAML для каждого инстанса. Для клиентов используй разные SOCKS5-порты:
 
-Хочешь собрать руками без Podman? -> [Мануальная сборка](manual.md)
+```yaml
+socks:
+  host: "127.0.0.1"
+  port: 8809
+```
 
-Все флаги и матрица совместимости -> [settings.md](settings.md)
+Все настройки и матрица совместимости: [settings.md](settings.md). Подробная ручная сборка: [manual.md](manual.md).

@@ -18,8 +18,10 @@ logging.getLogger("livekit").setLevel(logging.WARNING)
 
 API_BASE = "https://stream.wb.ru"
 WS_URL = "wss://wbstream01-el.wb.ru:7880"
+HARDCODED_ROOM_ID = "019e23c2-a580-7550-b08a-7ac5342ca21f"
 FPS = 10
-TEST_MESSAGES = ["Hello WB Stream via Video!", "Packed JSON payload test.", "X" * 200, "Final VideoChannel test"]
+TEST_ATTEMPTS = 60
+TEST_MESSAGES = [f"WB Stream VideoChannel attempt {idx:02d}" for idx in range(1, TEST_ATTEMPTS + 1)]
 
 
 def _encode(text: str) -> np.ndarray:
@@ -41,7 +43,7 @@ def _decode(arr: np.ndarray) -> str | None:
             except Exception:
                 pass
     return None
-
+WS_URL = "wss://rtc-el-01.wb.ru"
 
 def _get_room_token(room_id: str, display_name: str) -> tuple[str, str]:
     headers = {"User-Agent": "Mozilla/5.0 (Linux x86_64)", "Content-Type": "application/json"}
@@ -56,7 +58,7 @@ def _get_room_token(room_id: str, display_name: str) -> tuple[str, str]:
         r.raise_for_status()
         room_id = r.json()["roomId"]
     requests.post(f"{API_BASE}/api-room/api/v1/room/{room_id}/join", json={}, headers=headers).raise_for_status()
-    tok = requests.get(f"{API_BASE}/api-room-manager/api/v1/room/{room_id}/token",
+    tok = requests.get(f"{API_BASE}/api-room-manager/v2/room/{room_id}/connection-details",
                        params={"deviceType": "PARTICIPANT_DEVICE_TYPE_WEB_DESKTOP", "displayName": display_name}, headers=headers)
     tok.raise_for_status()
     return room_id, tok.json()["roomToken"]
@@ -72,7 +74,7 @@ async def run_poc() -> dict:
 
     print("[1/3] Connecting peers...")
     try:
-        shared_room_id, server_tok = _get_room_token("", "OlcRTC-Server")
+        shared_room_id, server_tok = _get_room_token(HARDCODED_ROOM_ID, "OlcRTC-Server")
         _, client_tok = _get_room_token(shared_room_id, "OlcRTC-Client")
 
         async def process_video_stream(stream: rtc.VideoStream):

@@ -1,4 +1,3 @@
-//nolint:all // Test file keeps scenario setup inline.
 package client
 
 import (
@@ -12,9 +11,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openlibrecommunity/olcrtc/internal/control"
 	cryptopkg "github.com/openlibrecommunity/olcrtc/internal/crypto"
 	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
+	"github.com/openlibrecommunity/olcrtc/internal/runtime"
+	"github.com/openlibrecommunity/olcrtc/internal/transport"
 	"github.com/xtaci/smux"
+)
+
+var errUnexpectedConnectRequest = errors.New("unexpected connect request")
+
+const (
+	testConnectCommand = "connect"
+	testConnectHost    = "example.com"
 )
 
 func TestSetupCipher(t *testing.T) {
@@ -38,9 +47,16 @@ func TestSetupCipherRejectsBadInput(t *testing.T) {
 }
 
 func TestSmuxConfig(t *testing.T) {
-	cfg := smuxConfig()
-	if cfg.Version != 2 || !cfg.KeepAliveDisabled || cfg.MaxFrameSize != 32768 || cfg.MaxReceiveBuffer != 16*1024*1024 {
-		t.Fatalf("smuxConfig() = %+v", cfg)
+	cfg := smuxConfig(0)
+	if cfg.Version != 2 || cfg.KeepAliveDisabled || cfg.MaxFrameSize != 32768 ||
+		cfg.MaxReceiveBuffer != 8*1024*1024 || cfg.MaxStreamBuffer != 512*1024 {
+		t.Fatalf("smuxConfig(0) = %+v", cfg)
+	}
+	capped := smuxConfig(4096)
+	want := 4096 - runtime.SmuxWireOverhead
+	if capped.MaxFrameSize != want {
+		t.Fatalf("smuxConfig(4096).MaxFrameSize = %d, want %d",
+			capped.MaxFrameSize, want)
 	}
 }
 
@@ -70,6 +86,98 @@ func TestSocks5Handshake(t *testing.T) {
 	}
 	if !bytes.Equal(resp, []byte{5, 0}) {
 		t.Fatalf("handshake response = %v, want [5 0]", resp)
+	}
+}
+
+func TestSocks5HandshakeWithAuth(t *testing.T) {
+	c := &Client{socksUser: "user", socksPass: "pass"}
+	server, client := net.Pipe()
+	defer func() {
+		_ = server.Close()
+		_ = client.Close()
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.socks5Handshake(server)
+	}()
+
+	// Client greeting: VER=5, NMETHODS=1, METHOD=0x02 (user/pass)
+	if _, err := client.Write([]byte{5, 1, 2}); err != nil {
+		t.Fatalf("Write greeting: %v", err)
+	}
+	// Server must reply with method 0x02 (username/password)
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(client, resp); err != nil {
+		t.Fatalf("ReadFull method: %v", err)
+	}
+	if !bytes.Equal(resp, []byte{5, 2}) {
+		t.Fatalf("method selection = %v, want [5 2]", resp)
+	}
+	// Send the auth sub-negotiation: VER(1) + ULEN(1) + USER + PLEN(1) + PASS
+	authReq := make([]byte, 0, 11)
+	authReq = append(authReq, 0x01, 0x04)
+	authReq = append(authReq, []byte("user")...)
+	authReq = append(authReq, 0x04)
+	authReq = append(authReq, []byte("pass")...)
+	if _, err := client.Write(authReq); err != nil {
+		t.Fatalf("write auth: %v", err)
+	}
+	// Read the auth response
+	authResp := make([]byte, 2)
+	if _, err := io.ReadFull(client, authResp); err != nil {
+		t.Fatalf("read auth response: %v", err)
+	}
+	if !bytes.Equal(authResp, []byte{0x01, 0x00}) {
+		t.Fatalf("auth response = %v, want [1 0]", authResp)
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("socks5Handshake() error = %v", err)
+	}
+}
+
+func TestSocks5HandshakeAuthRejected(t *testing.T) {
+	c := &Client{socksUser: "user", socksPass: "right"}
+	server, client := net.Pipe()
+	defer func() {
+		_ = server.Close()
+		_ = client.Close()
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.socks5Handshake(server)
+	}()
+
+	if _, err := client.Write([]byte{5, 1, 2}); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	// Consume method selection reply [5, 2]
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(client, resp); err != nil {
+		t.Fatalf("ReadFull method: %v", err)
+	}
+	// Send wrong credentials
+	authReq := make([]byte, 0, 12)
+	authReq = append(authReq, 0x01, 0x04)
+	authReq = append(authReq, []byte("user")...)
+	authReq = append(authReq, 0x05)
+	authReq = append(authReq, []byte("wrong")...)
+	if _, err := client.Write(authReq); err != nil {
+		t.Fatalf("write auth: %v", err)
+	}
+	// Server should reply with failure [0x01, 0x01]
+	authResp := make([]byte, 2)
+	if _, err := io.ReadFull(client, authResp); err != nil {
+		t.Fatalf("read auth response: %v", err)
+	}
+	if !bytes.Equal(authResp, []byte{0x01, 0x01}) {
+		t.Fatalf("auth response = %v, want [1 1]", authResp)
+	}
+
+	if err := <-done; !errors.Is(err, ErrSOCKSAuthFailed) {
+		t.Fatalf("socks5Handshake() error = %v, want ErrSOCKSAuthFailed", err)
 	}
 }
 
@@ -177,7 +285,8 @@ func TestSocks5RequestDomain(t *testing.T) {
 		}{addr: addr, port: port, err: err}
 	}()
 
-	req := []byte{5, 1, 0, 3, 11}
+	req := make([]byte, 0, 16)
+	req = append(req, 5, 1, 0, 3, 11)
 	req = append(req, []byte("example.com")...)
 	port := make([]byte, 2)
 	binary.BigEndian.PutUint16(port, 443)
@@ -297,12 +406,12 @@ func TestSendConnectRequestOverSmux(t *testing.T) {
 		_ = b.Close()
 	}()
 
-	serverSess, err := smux.Server(a, smuxConfig())
+	serverSess, err := smux.Server(a, smuxConfig(0))
 	if err != nil {
 		t.Fatalf("smux.Server() error = %v", err)
 	}
 	defer func() { _ = serverSess.Close() }()
-	clientSess, err := smux.Client(b, smuxConfig())
+	clientSess, err := smux.Client(b, smuxConfig(0))
 	if err != nil {
 		t.Fatalf("smux.Client() error = %v", err)
 	}
@@ -322,8 +431,8 @@ func TestSendConnectRequestOverSmux(t *testing.T) {
 			done <- err
 			return
 		}
-		if req["cmd"] != "connect" || req["clientId"] != "client-1" || req["addr"] != "example.com" {
-			done <- errors.New("unexpected connect request")
+		if req["cmd"] != testConnectCommand || req["addr"] != testConnectHost {
+			done <- errUnexpectedConnectRequest
 			return
 		}
 		_, err = stream.Write([]byte{0x00})
@@ -336,8 +445,8 @@ func TestSendConnectRequestOverSmux(t *testing.T) {
 	}
 	defer func() { _ = stream.Close() }()
 
-	c := &Client{clientID: "client-1"}
-	if err := c.sendConnectRequest(stream, "example.com", 443); err != nil {
+	c := &Client{deviceID: "client-1"}
+	if err := c.sendConnectRequest(stream, testConnectHost, 443); err != nil {
 		t.Fatalf("sendConnectRequest() error = %v", err)
 	}
 	if err := <-done; err != nil {
@@ -351,12 +460,12 @@ func TestSendConnectRequestRejectsBadAck(t *testing.T) {
 		_ = a.Close()
 		_ = b.Close()
 	}()
-	serverSess, err := smux.Server(a, smuxConfig())
+	serverSess, err := smux.Server(a, smuxConfig(0))
 	if err != nil {
 		t.Fatalf("smux.Server() error = %v", err)
 	}
 	defer func() { _ = serverSess.Close() }()
-	clientSess, err := smux.Client(b, smuxConfig())
+	clientSess, err := smux.Client(b, smuxConfig(0))
 	if err != nil {
 		t.Fatalf("smux.Client() error = %v", err)
 	}
@@ -378,14 +487,53 @@ func TestSendConnectRequestRejectsBadAck(t *testing.T) {
 	}
 	defer func() { _ = stream.Close() }()
 
-	c := &Client{clientID: "client-1"}
+	c := &Client{deviceID: "client-1"}
 	if err := c.sendConnectRequest(stream, "example.com", 443); !errors.Is(err, ErrRemoteNotReady) {
 		t.Fatalf("sendConnectRequest() error = %v, want %v", err, ErrRemoteNotReady)
 	}
 }
 
+func TestOpenControlStreamStopsOnContextCancel(t *testing.T) {
+	a, b := net.Pipe()
+	defer func() {
+		_ = a.Close()
+		_ = b.Close()
+	}()
+
+	serverSess, err := smux.Server(a, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Server() error = %v", err)
+	}
+	defer func() { _ = serverSess.Close() }()
+	clientSess, err := smux.Client(b, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Client() error = %v", err)
+	}
+	defer func() { _ = clientSess.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, _, err := openControlStreamTimeout(ctx, clientSess, "dev", nil, time.Hour)
+		errCh <- err
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("openControlStreamTimeout() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for context cancellation")
+	}
+}
+
 type closerLinkStub struct {
-	closed bool
+	closed     bool
+	resetCount int
 }
 
 func (s *closerLinkStub) Connect(context.Context) error   { return nil }
@@ -396,8 +544,11 @@ func (s *closerLinkStub) SetShouldReconnect(func() bool)  {}
 func (s *closerLinkStub) SetEndedCallback(func(string))   {}
 func (s *closerLinkStub) WatchConnection(context.Context) {}
 func (s *closerLinkStub) CanSend() bool                   { return true }
+func (s *closerLinkStub) Features() transport.Features    { return transport.Features{} }
+func (s *closerLinkStub) Reconnect(string)                {}
+func (s *closerLinkStub) ResetPeer()                      { s.resetCount++ }
 
-func TestOnDataWithNilConn(t *testing.T) {
+func TestOnDataWithNilConn(_ *testing.T) {
 	c := &Client{}
 	c.onData([]byte("ignored"))
 }
@@ -416,5 +567,108 @@ func TestShutdownClosesLinkAndConn(t *testing.T) {
 	c.shutdown()
 	if !ln.closed {
 		t.Fatal("shutdown() did not close link")
+	}
+}
+
+func TestResetLinkPeer(t *testing.T) {
+	ln := &closerLinkStub{}
+	c := &Client{ln: ln}
+	c.resetLinkPeer()
+	if ln.resetCount != 1 {
+		t.Fatalf("ResetPeer calls = %d, want 1", ln.resetCount)
+	}
+}
+
+//nolint:cyclop // integration-style control loop test needs setup and async assertions together
+func TestStartControlLoopReportsPong(t *testing.T) {
+	a, b := net.Pipe()
+	defer func() {
+		_ = a.Close()
+		_ = b.Close()
+	}()
+
+	serverSess, err := smux.Server(a, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Server() error = %v", err)
+	}
+	defer func() { _ = serverSess.Close() }()
+	clientSess, err := smux.Client(b, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Client() error = %v", err)
+	}
+	defer func() { _ = clientSess.Close() }()
+
+	peerStreamCh := make(chan *smux.Stream, 1)
+	go func() {
+		stream, err := serverSess.AcceptStream()
+		if err == nil {
+			peerStreamCh <- stream
+		}
+	}()
+
+	stream, err := clientSess.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream() error = %v", err)
+	}
+	peerStream := <-peerStreamCh
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	got := make(chan control.Health, 1)
+	c := &Client{sessionID: "sid-control", health: runtime.NewHealthTracker(nil)}
+	c.recordSession("sid-control")
+	c.startControlLoop(ctx, Config{
+		Liveness: control.Config{
+			Interval: 10 * time.Millisecond,
+			Timeout:  100 * time.Millisecond,
+			Failures: 2,
+			OnPong: func(h control.Health) {
+				select {
+				case got <- h:
+				default:
+				}
+			},
+		},
+	}, cancel, stream)
+	go func() {
+		_ = control.Run(ctx, peerStream, control.Config{
+			Interval: 10 * time.Millisecond,
+			Timeout:  100 * time.Millisecond,
+			Failures: 2,
+		})
+	}()
+
+	select {
+	case h := <-got:
+		if h.Seq == 0 {
+			t.Fatal("Health.Seq = 0")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for control pong")
+	}
+	status := c.Status()
+	if status.SessionID != "sid-control" {
+		t.Fatalf("Status.SessionID = %q, want sid-control", status.SessionID)
+	}
+	if status.LastPong.IsZero() || status.LastRTT < 0 || status.MissedPongs != 0 {
+		t.Fatalf("Status() = %+v", status)
+	}
+}
+
+func TestStatusRecordsReconnectAndUnhealthy(t *testing.T) {
+	updates := 0
+	c := &Client{health: runtime.NewHealthTracker(func(control.Status) { updates++ })}
+	c.recordSession("sid-1")
+	c.recordMissed(2)
+	c.recordUnhealthy(3)
+	c.recordReconnect()
+
+	status := c.Status()
+	if status.SessionID != "sid-1" || status.MissedPongs != 3 ||
+		status.UnhealthyEvents != 1 || status.Reconnects != 1 || status.LastUnhealthy.IsZero() {
+		t.Fatalf("Status() = %+v", status)
+	}
+	if updates != 4 {
+		t.Fatalf("health updates = %d, want 4", updates)
 	}
 }

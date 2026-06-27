@@ -27,11 +27,15 @@ const (
 	// clamped. Stay below that with headroom for KCP overhead (24 bytes).
 	kcpMTU = 1400
 
-	// Receive/send window in segments. Large window allows in-flight bursts
-	// without stalling - important when one VP8 frame may carry many KCP
-	// segments and ACKs trickle back at frame cadence.
-	kcpSndWnd = 4096
-	kcpRcvWnd = 4096
+	// Send/receive window in segments, sized to the bandwidth-delay product
+	// of the policed video path. VP8 over QR encoding has very low throughput
+	// (~0.3 MB/s observed). We use a moderate send window to balance:
+	// - Large enough for reasonable throughput (don't underutilize the pipe)
+	// - Small enough that control-plane pongs can get through within liveness timeout
+	// With 512 segments * 1400 bytes = ~716KB in-flight, and ~0.3 MB/s throughput,
+	// data sits in queue for ~2-3 seconds, giving control a chance to pass.
+	kcpSndWnd = 512
+	kcpRcvWnd = 1024
 
 	// Length prefix for our message framing on top of KCP stream mode.
 	// We use stream mode because UDPSession.Write fragments messages > MSS
@@ -69,16 +73,25 @@ func startKCP(out chan<- []byte, onData func([]byte), epochHdr [epochHdrLen]byte
 		return nil, fmt.Errorf("kcp new conn: %w", err)
 	}
 
-	// Aggressive ARQ tuning: nodelay=1, interval=5ms, fast resend=2, no
-	// congestion control. The 5ms tick (vs the kcptun-default 10ms) halves
-	// the worst-case scheduling latency in each direction, which matters a
-	// lot for interactive workloads (SOCKS5 + HTTP request needs ~3 RTTs
-	// before the first byte of the response shows up). Below 5ms the
-	// CPU cost of the KCP update loop starts climbing without much
-	// additional latency benefit.
-	sess.SetNoDelay(1, 5, 2, 1)
+	// nodelay=1, interval=5ms, fast resend=2, congestion control OFF (nc=1).
+	// KCP does NOT regulate the send rate here - the writerLoop byte pacer
+	// does, fed at a fixed rate just under the carrier's policer knee. KCP's
+	// own loss-based congestion control is the wrong controller for a hard
+	// policer: with nc=0 the unavoidable ~4% drops collapsed cwnd and starved
+	// the wire to ~45 KiB/s. With nc=1 KCP just keeps the BDP-sized window
+	// full and retransmits the few losses; the pacer caps the rate so we
+	// never overdrive the policer into its collapse zone.
+	// nodelay=1, interval=20ms (slower for QR-encoded VP8), fast resend=2, congestion control OFF (nc=1).
+	// QR-encoded VP8 has very low throughput (~0.3 MB/s), so we use a larger interval
+	// to allow batching and reduce overhead. KCP's own loss-based congestion control
+	// is disabled (nc=1) because the carrier has hard bandwidth limits; the writerLoop
+	// byte pacer handles rate limiting.
+	sess.SetNoDelay(1, 20, 2, 1)
 	sess.SetWindowSize(kcpSndWnd, kcpRcvWnd)
 	sess.SetMtu(kcpMTU)
+	// Upstream marked SetStreamMode deprecated without providing a replacement;
+	// stream framing is still required for our wire format.
+	sess.SetStreamMode(true) //nolint:staticcheck // SA1019: no replacement upstream.
 	sess.SetACKNoDelay(true)
 	sess.SetWriteDelay(false)
 
@@ -106,9 +119,6 @@ func (r *kcpRuntime) readLoop(onData func([]byte)) {
 			continue
 		}
 		if size > kcpMaxMessage {
-			// Stream framing is now corrupted - there is no safe way to
-			// resync without a session reset. Bail and let the upper layer
-			// reconnect.
 			return
 		}
 		payload := make([]byte, size)
@@ -126,6 +136,12 @@ func (r *kcpRuntime) deliver(payload []byte) {
 	r.conn.deliver(payload)
 }
 
+// setHeader re-points the outgoing frame header so subsequent KCP packets are
+// addressed to a specific destination epoch (see kcpConn.setHeader).
+func (r *kcpRuntime) setHeader(hdr [epochHdrLen]byte) {
+	r.conn.setHeader(hdr)
+}
+
 // send queues an application message for reliable delivery. The length
 // prefix + payload pair is written under a mutex so that interleaved
 // concurrent senders cannot tear the framing.
@@ -134,8 +150,7 @@ func (r *kcpRuntime) send(msg []byte) error {
 		return ErrKCPMessageTooLarge
 	}
 	var hdr [kcpLenPrefix]byte
-	//nolint:gosec
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(msg)))
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(msg))) //nolint:gosec,lll // G115: bounded conversion verified by surrounding logic
 
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()

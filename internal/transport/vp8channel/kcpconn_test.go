@@ -1,4 +1,3 @@
-//nolint:all // Test file keeps scenario setup inline.
 package vp8channel
 
 import (
@@ -9,6 +8,7 @@ import (
 	"time"
 )
 
+//nolint:cyclop // table-driven test naturally has many branches
 func TestKCPConnReadWriteDeadlinesAndClose(t *testing.T) {
 	out := make(chan []byte, 1)
 	hdr := testEpochHdr(9)

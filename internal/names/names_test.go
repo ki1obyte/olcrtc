@@ -1,4 +1,3 @@
-//nolint:all // Test file keeps scenario setup inline.
 package names
 
 import (
@@ -76,7 +75,7 @@ func TestGenerateFallsBackWhenNamesEmpty(t *testing.T) {
 }
 
 func TestRandomIndexBounds(t *testing.T) {
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		got := randomIndex(2)
 		if got < 0 || got > 1 {
 			t.Fatalf("randomIndex(2) = %d, out of range", got)

@@ -111,19 +111,71 @@ func TestVP8KeepaliveDoesNotLookLikeKCP(t *testing.T) {
 	}
 }
 
+func TestBatchSampleCarriesMultipleKCPPackets(t *testing.T) {
+	hdr := testEpochHdr(1)
+	packet := func(payload string) []byte {
+		frame := make([]byte, epochHdrLen+len(payload))
+		copy(frame, hdr[:])
+		copy(frame[epochHdrLen:], payload)
+		return frame
+	}
+
+	tr := &streamTransport{
+		outbound:  make(chan []byte, 4),
+		batchSize: 3,
+	}
+	tr.outbound <- packet("two")
+	tr.outbound <- packet("three")
+	tr.outbound <- packet("four")
+
+	sample := tr.batchSample(packet("one"), defaultMaxPayloadSize)
+	if !bytes.Equal(sample[:epochHdrLen], hdr[:]) {
+		t.Fatalf("sample epoch header = %x, want %x", sample[:epochHdrLen], hdr[:])
+	}
+
+	var got []string
+	splitKCPPayload(sample[epochHdrLen:], func(payload []byte) {
+		got = append(got, string(payload))
+	})
+	want := []string{"one", "two", "three"}
+	if len(got) != len(want) {
+		t.Fatalf("split payload count = %d, want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("payload[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if left := len(tr.outbound); left != 1 {
+		t.Fatalf("outbound left = %d, want 1", left)
+	}
+}
+
+func TestSplitKCPPayloadAcceptsLegacySinglePacket(t *testing.T) {
+	var got [][]byte
+	splitKCPPayload([]byte("single"), func(payload []byte) {
+		got = append(got, append([]byte(nil), payload...))
+	})
+	if len(got) != 1 || string(got[0]) != "single" {
+		t.Fatalf("split legacy payload = %q", got)
+	}
+}
+
 func testEpochHdr(epoch uint32) [epochHdrLen]byte {
 	var hdr [epochHdrLen]byte
 	copy(hdr[:], vp8Keepalive)
-	binary.BigEndian.PutUint32(hdr[tokenOff:epochOff], bindingToken("test"))
-	binary.BigEndian.PutUint32(hdr[epochOff:], epoch)
+	binary.BigEndian.PutUint32(hdr[tokenOff:srcOff], bindingToken("test"))
+	binary.BigEndian.PutUint32(hdr[srcOff:dstOff], epoch)
+	binary.BigEndian.PutUint32(hdr[dstOff:crcOff], 0)
+	binary.BigEndian.PutUint32(hdr[crcOff:epochHdrLen], epochCRC(bindingToken("test"), epoch, 0))
 	return hdr
 }
 
 func TestHandleIncomingFrameIgnoresLoopedBackLocalEpoch(t *testing.T) {
 	tr := &streamTransport{
 		bindingToken: bindingToken("test"),
-		localEpoch: 12345,
-		onData:     func([]byte) {},
+		localEpoch:   12345,
+		onData:       func([]byte) {},
 	}
 
 	var called atomic.Int32
@@ -131,13 +183,15 @@ func TestHandleIncomingFrameIgnoresLoopedBackLocalEpoch(t *testing.T) {
 
 	frame := make([]byte, epochHdrLen+4)
 	copy(frame, vp8Keepalive)
-	binary.BigEndian.PutUint32(frame[tokenOff:epochOff], tr.bindingToken)
-	binary.BigEndian.PutUint32(frame[epochOff:], tr.localEpoch)
+	binary.BigEndian.PutUint32(frame[tokenOff:srcOff], tr.bindingToken)
+	binary.BigEndian.PutUint32(frame[srcOff:dstOff], tr.localEpoch)
+	binary.BigEndian.PutUint32(frame[dstOff:crcOff], 0)
+	binary.BigEndian.PutUint32(frame[crcOff:epochHdrLen], epochCRC(tr.bindingToken, tr.localEpoch, 0))
 	copy(frame[epochHdrLen:], []byte{1, 2, 3, 4})
 
 	tr.handleIncomingFrame(frame)
 
-	if tr.hadPeer.Load() {
+	if tr.peerConfirmed.Load() {
 		t.Fatal("self-echo frame must not mark peer as seen")
 	}
 	if got := tr.peerEpoch.Load(); got != 0 {
@@ -160,13 +214,16 @@ func TestHandleIncomingFrameIgnoresForeignBindingToken(t *testing.T) {
 
 	frame := make([]byte, epochHdrLen+4)
 	copy(frame, vp8Keepalive)
-	binary.BigEndian.PutUint32(frame[tokenOff:epochOff], bindingToken("other-client"))
-	binary.BigEndian.PutUint32(frame[epochOff:], 999)
+	otherToken := bindingToken("other-client")
+	binary.BigEndian.PutUint32(frame[tokenOff:srcOff], otherToken)
+	binary.BigEndian.PutUint32(frame[srcOff:dstOff], 999)
+	binary.BigEndian.PutUint32(frame[dstOff:crcOff], 0)
+	binary.BigEndian.PutUint32(frame[crcOff:epochHdrLen], epochCRC(otherToken, 999, 0))
 	copy(frame[epochHdrLen:], []byte{1, 2, 3, 4})
 
 	tr.handleIncomingFrame(frame)
 
-	if tr.hadPeer.Load() {
+	if tr.peerConfirmed.Load() {
 		t.Fatal("foreign frame must not mark peer as seen")
 	}
 	if got := tr.peerEpoch.Load(); got != 0 {

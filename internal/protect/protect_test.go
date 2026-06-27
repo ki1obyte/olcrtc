@@ -1,15 +1,18 @@
-//nolint:all // Test file keeps scenario setup inline.
 package protect
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"net/http"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 )
+
+var errProtectBoom = errors.New("boom")
 
 type rawConnStub struct {
 	controlFn func(func(uintptr)) error
@@ -68,13 +71,14 @@ func TestControlFuncWrapsControlError(t *testing.T) {
 	t.Cleanup(func() { Protector = old })
 
 	err := controlFunc("tcp4", "", rawConnStub{
-		controlFn: func(func(uintptr)) error { return errors.New("boom") },
+		controlFn: func(func(uintptr)) error { return errProtectBoom },
 	})
 	if err == nil || err.Error() != "control failed: boom" {
 		t.Fatalf("controlFunc() error = %v", err)
 	}
 }
 
+//nolint:cyclop // table-driven test naturally has many branches
 func TestNewDialerAndHTTPClient(t *testing.T) {
 	dialer := NewDialer()
 	if dialer.Timeout != 10*time.Second || dialer.KeepAlive != 30*time.Second || dialer.Control == nil {
@@ -82,19 +86,68 @@ func TestNewDialerAndHTTPClient(t *testing.T) {
 	}
 
 	client := NewHTTPClient()
-	tr, ok := client.Transport.(*http.Transport)
+	rt, ok := client.Transport.(*retryTransport)
 	if !ok {
-		t.Fatalf("Transport type = %T, want *http.Transport", client.Transport)
+		t.Fatalf("Transport type = %T, want *protect.retryTransport", client.Transport)
 	}
-	if tr.DialContext == nil || !tr.ForceAttemptHTTP2 || tr.MaxIdleConns != 10 ||
+	tr, ok := rt.base.(*http.Transport)
+	if !ok {
+		t.Fatalf("base Transport type = %T, want *http.Transport", rt.base)
+	}
+	if tr.Proxy == nil || tr.DialContext == nil || tr.TLSClientConfig == nil ||
+		tr.TLSClientConfig.MinVersion != tls.VersionTLS12 || !tr.ForceAttemptHTTP2 || tr.MaxIdleConns != 10 ||
 		tr.IdleConnTimeout != 30*time.Second || tr.TLSHandshakeTimeout != 10*time.Second ||
-		tr.ResponseHeaderTimeout != 10*time.Second {
+		tr.ResponseHeaderTimeout != 10*time.Second || client.Timeout != 30*time.Second {
 		t.Fatalf("transport = %+v", tr)
 	}
 }
 
+func TestNewWebSocketDialer(t *testing.T) {
+	dialer := NewWebSocketDialer(3 * time.Second)
+	if dialer.NetDialContext == nil || dialer.Proxy == nil || dialer.TLSClientConfig == nil ||
+		dialer.TLSClientConfig.MinVersion != tls.VersionTLS12 ||
+		dialer.HandshakeTimeout != 3*time.Second {
+		t.Fatalf("NewWebSocketDialer() = %+v", dialer)
+	}
+
+	defaulted := NewWebSocketDialer(0)
+	if defaulted.HandshakeTimeout != defaultWebSocketTimeout {
+		t.Fatalf("default HandshakeTimeout = %v, want %v",
+			defaulted.HandshakeTimeout, defaultWebSocketTimeout)
+	}
+}
+
+func TestStatusErrorRedactsAndLimitsBody(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusForbidden,
+		Body:       ioNopCloser{strings.NewReader(`{"accessToken":"secret","message":"no"}`)},
+	}
+	err := StatusError(errProtectBoom, resp, 1024)
+	if err == nil {
+		t.Fatal("StatusError() error = nil")
+	}
+	text := err.Error()
+	if strings.Contains(text, "secret") || !strings.Contains(text, "<redacted>") {
+		t.Fatalf("StatusError() = %q, want redacted token", text)
+	}
+}
+
+func TestRedactSensitiveBearer(t *testing.T) {
+	got := RedactSensitive("Authorization: Bearer abc.def")
+	if strings.Contains(got, "abc.def") || !strings.Contains(got, "Bearer <redacted>") {
+		t.Fatalf("RedactSensitive() = %q", got)
+	}
+}
+
+type ioNopCloser struct {
+	*strings.Reader
+}
+
+func (c ioNopCloser) Close() error { return nil }
+
 func TestDialContextAndProxyDialer(t *testing.T) {
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen() error = %v", err)
 	}
@@ -102,7 +155,7 @@ func TestDialContextAndProxyDialer(t *testing.T) {
 
 	accepted := make(chan struct{}, 2)
 	go func() {
-		for i := 0; i < 2; i++ {
+		for range 2 {
 			conn, err := ln.Accept()
 			if err != nil {
 				return

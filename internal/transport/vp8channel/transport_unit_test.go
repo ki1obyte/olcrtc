@@ -1,4 +1,3 @@
-//nolint:all // Test file keeps scenario setup inline.
 package vp8channel
 
 import (
@@ -6,44 +5,75 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
-	"github.com/openlibrecommunity/olcrtc/internal/carrier"
+	"github.com/openlibrecommunity/olcrtc/internal/engine"
+	enginebuiltin "github.com/openlibrecommunity/olcrtc/internal/engine/builtin"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
-type fakeVideoSession struct {
-	stream *fakeVideoStream
-	err    error
+var errVP8UnitBoom = errors.New("boom")
+
+// TestControlEpochTracksDataEpoch guards the issue #95 multi-client invariant:
+// the control-plane epoch is derived live from the data epoch as
+// localEpoch|controlEpochFlag. This lets the server correlate a client's data
+// and control planes by arithmetic (controlEpoch &^ controlEpochFlag ==
+// dataEpoch), which is what keys the per-peer control sessions. The two planes
+// rotate together on reconnect; the control epoch always carries the high bit
+// and always shares the current data epoch's low bits.
+func TestControlEpochTracksDataEpoch(t *testing.T) {
+	tr := &streamTransport{
+		bindingToken: bindingToken("room-95"),
+		localEpoch:   randomEpoch(),
+	}
+
+	check := func(stage string) {
+		data := tr.localEpochValue()
+		ctrl := tr.controlEpochValue()
+		if ctrl&controlEpochFlag == 0 {
+			t.Fatalf("%s: control epoch 0x%08x missing control flag", stage, ctrl)
+		}
+		if ctrl != data|controlEpochFlag {
+			t.Fatalf("%s: control epoch 0x%08x != data 0x%08x | flag", stage, ctrl, data)
+		}
+		if ctrl&^controlEpochFlag != data {
+			t.Fatalf("%s: control epoch does not correlate to data epoch 0x%08x", stage, data)
+		}
+		hdr := tr.controlEpochHeader()
+		_, hdrEpoch, _, ok := parseEpochHeader(hdr[:])
+		if !ok {
+			t.Fatalf("%s: control epoch header failed to parse", stage)
+		}
+		if hdrEpoch != ctrl {
+			t.Fatalf("%s: control wire epoch 0x%08x != controlEpochValue 0x%08x", stage, hdrEpoch, ctrl)
+		}
+	}
+
+	check("initial")
+	// Both planes rotate together across reconnects.
+	for range 5 {
+		tr.rotateEpochHeader()
+		check("after rotation")
+	}
 }
 
-func TestSampleIntervalWithBatch(t *testing.T) {
+func TestWriterCadenceStaysAtFrameInterval(t *testing.T) {
 	tr := &streamTransport{
 		frameInterval: time.Second / 60,
 		batchSize:     64,
 	}
-	want := time.Second / 60 / 64
-	if got := tr.sampleInterval(); got != want {
-		t.Fatalf("sampleInterval() = %v, want %v", got, want)
+	if got := tr.frameInterval; got != time.Second/60 {
+		t.Fatalf("frameInterval = %v, want %v", got, time.Second/60)
 	}
 
 	tr.batchSize = 1
-	if got := tr.sampleInterval(); got != tr.frameInterval {
-		t.Fatalf("sampleInterval(batch=1) = %v, want %v", got, tr.frameInterval)
+	if got := tr.frameInterval; got != time.Second/60 {
+		t.Fatalf("frameInterval after batch change = %v, want %v", got, time.Second/60)
 	}
-}
-
-func (s *fakeVideoSession) Capabilities() carrier.Capabilities {
-	return carrier.Capabilities{VideoTrack: true}
-}
-func (s *fakeVideoSession) OpenVideoTrack() (carrier.VideoTrack, error) {
-	if s.err != nil {
-		return nil, s.err
-	}
-	return s.stream, nil
 }
 
 type fakeVideoStream struct {
@@ -69,40 +99,80 @@ func (s *fakeVideoStream) SetShouldReconnect(fn func() bool) { s.should = fn }
 func (s *fakeVideoStream) SetEndedCallback(cb func(string))  { s.ended = cb }
 func (s *fakeVideoStream) WatchConnection(context.Context)   { s.watched = true }
 func (s *fakeVideoStream) CanSend() bool                     { return s.canSend }
+func (s *fakeVideoStream) SubscriberCanSend() bool           { return s.canSend }
 func (s *fakeVideoStream) AddTrack(webrtc.TrackLocal) error  { s.trackAdded = true; return nil }
+func (s *fakeVideoStream) Reconnect(string)                  {}
 func (s *fakeVideoStream) SetTrackHandler(cb func(*webrtc.TrackRemote, *webrtc.RTPReceiver)) {
 	s.trackCB = cb
 }
 
-type nonVideoSession struct{}
+// fakeEngineSession adapts fakeVideoStream so it satisfies engine.Session and
+// engine.VideoTrackCapable, the two interfaces the vp8channel transport
+// looks up after the carrier-layer collapse.
+type fakeEngineSession struct {
+	stream  *fakeVideoStream
+	noVideo bool
+}
 
-func (s *nonVideoSession) Capabilities() carrier.Capabilities { return carrier.Capabilities{} }
+func (s *fakeEngineSession) Capabilities() engine.Capabilities {
+	if s.noVideo {
+		return engine.Capabilities{}
+	}
+	return engine.Capabilities{VideoTrack: true}
+}
+func (s *fakeEngineSession) Connect(ctx context.Context) error { return s.stream.Connect(ctx) }
+func (s *fakeEngineSession) Send([]byte) error                 { return nil }
+func (s *fakeEngineSession) Close() error                      { return s.stream.Close() }
+func (s *fakeEngineSession) SetReconnectCallback(cb func(*webrtc.DataChannel)) {
+	s.stream.SetReconnectCallback(func() {
+		if cb != nil {
+			cb(nil)
+		}
+	})
+}
+func (s *fakeEngineSession) SetShouldReconnect(fn func() bool) { s.stream.SetShouldReconnect(fn) }
+func (s *fakeEngineSession) SetEndedCallback(cb func(string))  { s.stream.SetEndedCallback(cb) }
+func (s *fakeEngineSession) WatchConnection(ctx context.Context) {
+	s.stream.WatchConnection(ctx)
+}
+func (s *fakeEngineSession) CanSend() bool                           { return s.stream.CanSend() }
+func (s *fakeEngineSession) SubscriberCanSend() bool                 { return s.stream.SubscriberCanSend() }
+func (s *fakeEngineSession) GetSendQueue() chan []byte               { return nil }
+func (s *fakeEngineSession) GetBufferedAmount() uint64               { return 0 }
+func (s *fakeEngineSession) Reconnect(string)                        {}
+func (s *fakeEngineSession) AddVideoTrack(t webrtc.TrackLocal) error { return s.stream.AddTrack(t) }
+func (s *fakeEngineSession) SetVideoTrackHandler(cb func(*webrtc.TrackRemote, *webrtc.RTPReceiver)) {
+	s.stream.SetTrackHandler(cb)
+}
 
+//nolint:cyclop // table-driven test naturally has many branches
 func TestNewConnectSendCallbacksFeaturesAndClose(t *testing.T) {
 	stream := &fakeVideoStream{canSend: true}
 	name := "vp8channel-unit-new"
-	carrier.Register(name, func(context.Context, carrier.Config) (carrier.Session, error) {
-		return &fakeVideoSession{stream: stream}, nil
+	enginebuiltin.Register(name, func(context.Context, enginebuiltin.Config) (engine.Session, error) {
+		return &fakeEngineSession{stream: stream}, nil
 	})
 
 	trIface, err := New(context.Background(), transport.Config{
-		Carrier:      name,
-		ClientID:     "client",
-		VP8FPS:       30,
-		VP8BatchSize: 1,
+		Carrier:  name,
+		DeviceID: "client",
+		Options:  Options{FPS: 30, BatchSize: 1},
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	tr := trIface.(*streamTransport)
+	tr, ok := trIface.(*streamTransport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *streamTransport", trIface)
+	}
 	if !stream.trackAdded || stream.trackCB == nil {
 		t.Fatal("New() did not attach track and handler")
 	}
 	if err := tr.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect() error = %v", err)
 	}
-	if tr.kcp != nil || !tr.writerUp.Load() {
-		t.Fatal("Connect() should not initialize kcp before peer arrives")
+	if tr.kcp == nil || !tr.writerUp.Load() {
+		t.Fatal("Connect() should eagerly initialize kcp and writer")
 	}
 	tr.SetReconnectCallback(func() {})
 	tr.SetShouldReconnect(func() bool { return true })
@@ -115,8 +185,10 @@ func TestNewConnectSendCallbacksFeaturesAndClose(t *testing.T) {
 	peerEpoch := uint32(0x200)
 	firstFrame := make([]byte, epochHdrLen+4)
 	copy(firstFrame, vp8Keepalive)
-	binary.BigEndian.PutUint32(firstFrame[tokenOff:epochOff], tr.bindingToken)
-	binary.BigEndian.PutUint32(firstFrame[epochOff:epochHdrLen], peerEpoch)
+	binary.BigEndian.PutUint32(firstFrame[tokenOff:srcOff], tr.bindingToken)
+	binary.BigEndian.PutUint32(firstFrame[srcOff:dstOff], peerEpoch)
+	binary.BigEndian.PutUint32(firstFrame[dstOff:crcOff], 0)
+	binary.BigEndian.PutUint32(firstFrame[crcOff:epochHdrLen], epochCRC(tr.bindingToken, peerEpoch, 0))
 	copy(firstFrame[epochHdrLen:], []byte("data"))
 	tr.handleIncomingFrame(firstFrame)
 	if tr.kcp == nil {
@@ -126,7 +198,7 @@ func TestNewConnectSendCallbacksFeaturesAndClose(t *testing.T) {
 	if !tr.CanSend() {
 		t.Fatal("CanSend() = false, want true")
 	}
-	if features := tr.Features(); !features.Reliable || !features.Ordered || !features.MessageOriented || features.MaxPayloadSize == 0 {
+	if features := tr.Features(); !features.Reliable || !features.Ordered || !features.MessageOriented || features.MaxPayloadSize == 0 { //nolint:lll // long test description
 		t.Fatalf("Features() = %+v", features)
 	}
 	if err := tr.Send([]byte("payload")); err != nil {
@@ -142,28 +214,24 @@ func TestNewConnectSendCallbacksFeaturesAndClose(t *testing.T) {
 }
 
 func TestNewErrorPaths(t *testing.T) {
-	carrier.Register("vp8channel-create-fails", func(context.Context, carrier.Config) (carrier.Session, error) {
-		return nil, errors.New("boom")
+	enginebuiltin.Register("vp8channel-create-fails", func(context.Context, enginebuiltin.Config) (engine.Session, error) {
+		return nil, errVP8UnitBoom
 	})
-	if _, err := New(context.Background(), transport.Config{Carrier: "vp8channel-create-fails"}); err == nil || err.Error() != "create carrier transport: boom" {
+	_, err := New(context.Background(), transport.Config{Carrier: "vp8channel-create-fails"})
+	if err == nil || err.Error() != "open engine session: boom" {
 		t.Fatalf("New() error = %v", err)
 	}
 
-	carrier.Register("vp8channel-no-video", func(context.Context, carrier.Config) (carrier.Session, error) {
-		return &nonVideoSession{}, nil
+	enginebuiltin.Register("vp8channel-no-video", func(context.Context, enginebuiltin.Config) (engine.Session, error) {
+		return &fakeEngineSession{stream: &fakeVideoStream{}, noVideo: true}, nil
 	})
-	if _, err := New(context.Background(), transport.Config{Carrier: "vp8channel-no-video"}); !errors.Is(err, ErrVideoTrackUnsupported) {
+	_, err = New(context.Background(), transport.Config{Carrier: "vp8channel-no-video"})
+	if !errors.Is(err, ErrVideoTrackUnsupported) {
 		t.Fatalf("New() error = %v, want %v", err, ErrVideoTrackUnsupported)
-	}
-
-	carrier.Register("vp8channel-open-fails", func(context.Context, carrier.Config) (carrier.Session, error) {
-		return &fakeVideoSession{err: errors.New("open boom")}, nil
-	})
-	if _, err := New(context.Background(), transport.Config{Carrier: "vp8channel-open-fails"}); err == nil || err.Error() != "open video track: open boom" {
-		t.Fatalf("New() error = %v", err)
 	}
 }
 
+//nolint:cyclop // table-driven test naturally has many branches
 func TestEpochHeaderTokenAndOutboundCapacity(t *testing.T) {
 	tr := &streamTransport{
 		stream:       &fakeVideoStream{canSend: true},
@@ -176,8 +244,10 @@ func TestEpochHeaderTokenAndOutboundCapacity(t *testing.T) {
 
 	hdr := tr.epochHeader()
 	if !bytes.Equal(hdr[:tokenOff], vp8Keepalive) ||
-		binary.BigEndian.Uint32(hdr[tokenOff:epochOff]) != tr.bindingToken ||
-		binary.BigEndian.Uint32(hdr[epochOff:]) != tr.localEpoch {
+		binary.BigEndian.Uint32(hdr[tokenOff:srcOff]) != tr.bindingToken ||
+		binary.BigEndian.Uint32(hdr[srcOff:dstOff]) != tr.localEpoch ||
+		binary.BigEndian.Uint32(hdr[dstOff:crcOff]) != 0 ||
+		binary.BigEndian.Uint32(hdr[crcOff:epochHdrLen]) != epochCRC(tr.bindingToken, tr.localEpoch, 0) {
 		t.Fatalf("epochHeader() = %x", hdr)
 	}
 	if bindingToken("") == 0 || randomEpoch() == 0 {
@@ -206,6 +276,50 @@ func TestEpochHeaderTokenAndOutboundCapacity(t *testing.T) {
 	tr.closed.Store(true)
 	if tr.CanSend() {
 		t.Fatal("CanSend() = true after closed")
+	}
+}
+
+func TestResetPeerRestartsKCPAndDrainsOutbound(t *testing.T) {
+	tr := &streamTransport{
+		stream:       &fakeVideoStream{canSend: true},
+		outbound:     make(chan []byte, 10),
+		closeCh:      make(chan struct{}),
+		writerDone:   make(chan struct{}),
+		bindingToken: bindingToken("client"),
+		localEpoch:   0x01020304,
+	}
+	defer func() {
+		_ = tr.Close()
+	}()
+
+	rt, err := startKCP(tr.outbound, nil, tr.epochHeader())
+	if err != nil {
+		t.Fatalf("startKCP: %v", err)
+	}
+	tr.kcpMu.Lock()
+	tr.kcp = rt
+	tr.kcpMu.Unlock()
+	tr.outbound <- []byte("stale")
+	oldEpoch := tr.localEpoch
+
+	tr.ResetPeer()
+
+	tr.kcpMu.RLock()
+	got := tr.kcp
+	tr.kcpMu.RUnlock()
+	if got == nil || got == rt {
+		t.Fatalf("ResetPeer kcp = %p, want fresh non-nil runtime distinct from %p", got, rt)
+	}
+	if len(tr.outbound) != 0 {
+		t.Fatalf("ResetPeer left %d outbound frame(s), want 0", len(tr.outbound))
+	}
+	if tr.localEpoch == oldEpoch {
+		t.Fatalf("ResetPeer localEpoch = %#x, want different epoch", tr.localEpoch)
+	}
+	select {
+	case <-rt.readDone:
+	case <-time.After(time.Second):
+		t.Fatal("old KCP runtime did not stop")
 	}
 }
 
@@ -257,6 +371,7 @@ func TestVP8FrameStateAssemblesAndRejectsCorruptFrames(t *testing.T) {
 	}
 }
 
+//nolint:cyclop // table-driven test naturally has many branches
 func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 	called := 0
 	tr := &streamTransport{
@@ -275,26 +390,35 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 	mkFrame := func(token, epoch uint32, payload []byte) []byte {
 		frame := make([]byte, epochHdrLen+len(payload))
 		copy(frame, vp8Keepalive)
-		binary.BigEndian.PutUint32(frame[tokenOff:epochOff], token)
-		binary.BigEndian.PutUint32(frame[epochOff:epochHdrLen], epoch)
+		binary.BigEndian.PutUint32(frame[tokenOff:srcOff], token)
+		binary.BigEndian.PutUint32(frame[srcOff:dstOff], epoch)
+		binary.BigEndian.PutUint32(frame[dstOff:crcOff], 0)
+		binary.BigEndian.PutUint32(frame[crcOff:epochHdrLen], epochCRC(token, epoch, 0))
 		copy(frame[epochHdrLen:], payload)
 		return frame
 	}
 
 	tr.handleIncomingFrame(mkFrame(bindingToken("other"), 1, []byte("x")))
 	tr.handleIncomingFrame(mkFrame(tr.bindingToken, tr.localEpoch, []byte("self")))
-	if tr.hadPeer.Load() || called != 0 {
+	if tr.peerConfirmed.Load() || called != 0 {
 		t.Fatal("filtered frames changed peer state")
 	}
 
+	// Keepalive (nil payload) latches peer immediately.
 	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 1, nil))
-	if !tr.hadPeer.Load() || tr.peerEpoch.Load() != 1 {
-		t.Fatalf("peer state after first frame: had=%v epoch=%d", tr.hadPeer.Load(), tr.peerEpoch.Load())
+	if !tr.peerConfirmed.Load() {
+		t.Fatal("first frame should confirm peer")
+	}
+	if tr.peerEpoch.Load() != 1 {
+		t.Fatalf("peer epoch not stored: got %d want 1", tr.peerEpoch.Load())
 	}
 
 	reconnected := false
 	tr.SetReconnectCallback(func() { reconnected = true })
-	stream := tr.stream.(*fakeVideoStream)
+	stream, ok := tr.stream.(*fakeVideoStream)
+	if !ok {
+		t.Fatalf("stream type = %T, want *fakeVideoStream", tr.stream)
+	}
 	if stream.reconnect == nil {
 		t.Fatal("SetReconnectCallback did not install stream callback")
 	}
@@ -303,8 +427,89 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 		t.Fatalf("stream reconnect did not reset/callback: reconnected=%v kcp=%v", reconnected, tr.kcp)
 	}
 	reconnected = false
-	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 2, []byte("after-restart")))
-	if !reconnected || tr.peerEpoch.Load() != 2 || tr.kcp == nil {
-		t.Fatalf("epoch change did not reset/reconnect: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp)
+	// After reconnect, peerConfirmed is reset so the next frame re-latches
+	// the peer epoch. This allows the server to restart with a new epoch.
+	if tr.peerConfirmed.Load() {
+		t.Fatal("reconnect should reset peerConfirmed")
+	}
+	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 2, []byte("new-peer-after-reconnect")))
+	if !tr.peerConfirmed.Load() {
+		t.Fatal("frame after reconnect should re-latch peer")
+	}
+	if tr.peerEpoch.Load() != 2 {
+		t.Fatalf("peer epoch not re-latched: got %d want 2", tr.peerEpoch.Load())
+	}
+}
+
+func seqList(pkts []*rtp.Packet) []uint16 {
+	out := make([]uint16, len(pkts))
+	for i, p := range pkts {
+		out[i] = p.SequenceNumber
+	}
+	return out
+}
+
+func TestReorderBufferRestoresOrderAndSurvivesLoss(t *testing.T) {
+	// In-order packets pass straight through.
+	b := newReorderBuffer()
+	got := make([]uint16, 0, 3)
+	for _, seq := range []uint16{100, 101, 102} {
+		got = append(got, seqList(b.push(&rtp.Packet{Header: rtp.Header{SequenceNumber: seq}}))...)
+	}
+	if !reflect.DeepEqual(got, []uint16{100, 101, 102}) {
+		t.Fatalf("in-order drain = %v, want [100 101 102]", got)
+	}
+
+	// A reordered packet is held until the gap fills, then both drain in order.
+	b = newReorderBuffer()
+	if out := b.push(&rtp.Packet{Header: rtp.Header{SequenceNumber: 10}}); !reflect.DeepEqual(seqList(out), []uint16{10}) {
+		t.Fatalf("first packet = %v, want [10]", seqList(out))
+	}
+	// 12 arrives before 11: must be buffered, nothing delivered yet.
+	if out := b.push(&rtp.Packet{Header: rtp.Header{SequenceNumber: 12}}); out != nil {
+		t.Fatalf("out-of-order packet drained early = %v, want nil", seqList(out))
+	}
+	// 11 fills the hole: 11 and 12 drain in order.
+	out := b.push(&rtp.Packet{Header: rtp.Header{SequenceNumber: 11}})
+	if !reflect.DeepEqual(seqList(out), []uint16{11, 12}) {
+		t.Fatalf("gap fill drain = %v, want [11 12]", seqList(out))
+	}
+
+	// Genuine loss: a full window piles up behind a hole, buffer skips the
+	// lost sequence rather than stalling forever.
+	b = newReorderBuffer()
+	_ = b.push(&rtp.Packet{Header: rtp.Header{SequenceNumber: 0}})
+	var delivered int
+	for i := 2; i <= reorderWindow+2; i++ {
+		seq := uint16(i & 0xffff)
+		delivered += len(b.push(&rtp.Packet{Header: rtp.Header{SequenceNumber: seq}}))
+	}
+	if delivered == 0 {
+		t.Fatal("buffer stalled on lost packet: nothing delivered after window overflow")
+	}
+
+	// Stale packets older than the current position are dropped.
+	b = newReorderBuffer()
+	_ = b.push(&rtp.Packet{Header: rtp.Header{SequenceNumber: 50}})
+	if out := b.push(&rtp.Packet{Header: rtp.Header{SequenceNumber: 49}}); out != nil {
+		t.Fatalf("stale packet delivered = %v, want nil", seqList(out))
+	}
+}
+
+func TestSeqLessWrapAround(t *testing.T) {
+	cases := []struct {
+		a, b uint16
+		want bool
+	}{
+		{1, 2, true},
+		{2, 1, false},
+		{65535, 0, true},  // wrap: 65535 precedes 0
+		{0, 65535, false}, // wrap: 0 follows 65535
+		{10, 10, false},
+	}
+	for _, c := range cases {
+		if got := seqLess(c.a, c.b); got != c.want {
+			t.Fatalf("seqLess(%d, %d) = %v, want %v", c.a, c.b, got, c.want)
+		}
 	}
 }
